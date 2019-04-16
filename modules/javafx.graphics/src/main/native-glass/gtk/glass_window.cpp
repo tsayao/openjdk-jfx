@@ -1254,7 +1254,20 @@ void WindowContextTop::window_configure(XWindowChanges *windowChanges,
         if (windowChangesMask & CWY) {
             newY = windowChanges->y;
         }
+
+        //JDK-8212060: as gtk docs states, some window managers will only move the
+        //window after its shown. This prevents the glitch.
+        bool hide_and_show = is_visible();
+
+        if (hide_and_show) {
+            gtk_widget_hide(gtk_widget);
+        }
+
         gtk_window_move(GTK_WINDOW(gtk_widget), newX, newY);
+
+        if (hide_and_show) {
+            gtk_widget_show_all(gtk_widget);
+        }
     }
 
     if (windowChangesMask & (CWWidth | CWHeight)) {
