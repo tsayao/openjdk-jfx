@@ -524,18 +524,13 @@ const char * const SOURCE_DND_ACTIONS = "fx-dnd-actions";
 static GdkWindow* get_dnd_window()
 {
     if (dnd_window == NULL) {
-        GdkWindowAttr attr;
-        memset(&attr, 0, sizeof (GdkWindowAttr));
-        attr.override_redirect = TRUE;
-        attr.window_type = GDK_WINDOW_TEMP;
-        attr.type_hint = GDK_WINDOW_TYPE_HINT_UTILITY;
-        attr.wclass = GDK_INPUT_OUTPUT;
-        attr.event_mask = GDK_ALL_EVENTS_MASK;
-        dnd_window = gdk_window_new(NULL, &attr, GDK_WA_NOREDIR | GDK_WA_TYPE_HINT);
+        GtkWidget *widget = gtk_window_new(GTK_WINDOW_POPUP);
+        gtk_window_set_screen(GTK_WINDOW(widget), gdk_screen_get_default());
+        gtk_window_resize(GTK_WINDOW(widget), 1, 1);
+        gtk_window_move(GTK_WINDOW(widget), -99, -99);
+        gtk_widget_show(widget);
 
-        gdk_window_move(dnd_window, -99, -99);
-        gdk_window_resize(dnd_window, 1, 1);
-        gdk_window_show(dnd_window);
+        dnd_window = gtk_widget_get_window(widget);
     }
     return dnd_window;
 }
@@ -574,10 +569,114 @@ static gboolean dnd_finish_callback(gpointer) {
     return FALSE;
 }
 
+static void pixbufDestroyNotifyFunc(guchar *pixels, gpointer) {
+    if (pixels != NULL) {
+        g_free(pixels);
+    }
+}
+
+static jobject dnd_source_get_data(const char *key)
+{
+    jobject data = (jobject)g_object_get_data(G_OBJECT(dnd_window), SOURCE_DND_DATA);
+    jstring string = mainEnv->NewStringUTF(key);
+    EXCEPTION_OCCURED(mainEnv);
+    jobject result = mainEnv->CallObjectMethod(data, jMapGet, string, NULL);
+
+    return (EXCEPTION_OCCURED(mainEnv)) ? NULL : result;
+}
+
+static GdkPixbuf* _get_drag_image(gboolean* is_raw_image, gint* width, gint* height) {
+    GdkPixbuf *pixbuf = NULL;
+    gboolean is_raw = FALSE;
+
+    jobject drag_image = dnd_source_get_data("application/x-java-drag-image");
+
+    if (drag_image) {
+        jbyteArray byteArray = (jbyteArray) mainEnv->CallObjectMethod(drag_image, jByteBufferArray);
+        if (!EXCEPTION_OCCURED(mainEnv)) {
+
+            jbyte* raw = mainEnv->GetByteArrayElements(byteArray, NULL);
+            jsize nraw = mainEnv->GetArrayLength(byteArray);
+
+            int w = 0, h = 0;
+            int whsz = sizeof(jint) * 2; // Pixels are stored right after two ints
+            // in this byteArray: width and height
+            if (nraw > whsz) {
+                jint* int_raw = (jint*) raw;
+                w = BSWAP_32(int_raw[0]);
+                h = BSWAP_32(int_raw[1]);
+
+                // We should have enough pixels for requested width and height
+                if ((nraw - whsz) / 4 - w * h >= 0 ) {
+                    guchar* data = (guchar*) g_try_malloc0(nraw - whsz);
+                    if (data) {
+                        memcpy(data, (raw + whsz), nraw - whsz);
+                        pixbuf = gdk_pixbuf_new_from_data(data, GDK_COLORSPACE_RGB, TRUE, 8,
+                                                          w, h, w * 4, pixbufDestroyNotifyFunc, NULL);
+                    }
+                }
+            }
+            mainEnv->ReleaseByteArrayElements(byteArray, raw, JNI_ABORT);
+        }
+    }
+
+    if (!GDK_IS_PIXBUF(pixbuf)) {
+        jobject pixels = dnd_source_get_data("application/x-java-rawimage");
+        if (pixels) {
+            is_raw = TRUE;
+            mainEnv->CallVoidMethod(pixels, jPixelsAttachData, PTR_TO_JLONG(&pixbuf));
+            CHECK_JNI_EXCEPTION_RET(mainEnv, NULL)
+        }
+    }
+
+    if (!GDK_IS_PIXBUF(pixbuf)) {
+        return NULL;
+    }
+
+    int w = gdk_pixbuf_get_width(pixbuf);
+    int h = gdk_pixbuf_get_height(pixbuf);
+
+    if (w > DRAG_IMAGE_MAX_WIDTH || h > DRAG_IMAGE_MAX_HEIGH) {
+        double rw = DRAG_IMAGE_MAX_WIDTH / (double)w;
+        double rh =  DRAG_IMAGE_MAX_HEIGH / (double)h;
+        double r = MIN(rw, rh);
+
+
+        int new_w = w * r;
+        int new_h = h * r;
+
+        w = new_w;
+        h = new_h;
+
+        GdkPixbuf *tmp_pixbuf = gdk_pixbuf_scale_simple(pixbuf, new_w, new_h, GDK_INTERP_TILES);
+        g_object_unref(pixbuf);
+        if (!GDK_IS_PIXBUF(tmp_pixbuf)) {
+            return NULL;
+        }
+        pixbuf = tmp_pixbuf;
+    }
+
+    *is_raw_image = is_raw;
+    *width = w;
+    *height = h;
+
+    return pixbuf;
+}
+
 #ifdef GLASS_GTK3
 
 static void dnd_finished_callback(GdkDragContext *ctx, gpointer user_data) {
     dnd_finish_callback(user_data);
+}
+
+static gboolean dnd_update_drag_view(gpointer) {
+    gint x, y;
+
+    gdk_device_get_position(gdk_drag_context_get_device(get_drag_context()),
+                                NULL, &x, &y);
+    DragView::move(x, y);
+
+    return FALSE;
 }
 
 #if GTK_CHECK_VERSION(3, 20, 0)
@@ -593,21 +692,45 @@ static void dnd_cancel_callback(GdkDragContext *ctx, GdkDragCancelReason reason,
     g_print("CANCEL\n");
     dnd_finish_callback(user_data);
 }
-#endif
-#endif
 
-#ifdef GLASS_GTK3
-static gboolean dnd_update_drag_view(gpointer) {
-    gint x, y;
+static void paint_drag_view(GdkWindow *window) {
+    cairo_t *context = gdk_cairo_create(window);
 
-    gdk_device_get_position(gdk_drag_context_get_device(get_drag_context()),
-                                NULL, &x, &y);
+    gboolean is_raw_image;
+    gint w, h;
 
+    GdkPixbuf* pixbuf = _get_drag_image(&is_raw_image, &w, &h);
 
-    DragView::move(x, y);
+    if(pixbuf == NULL)
+        return;
 
-    return FALSE;
+    gdk_window_resize(window, w, h);
+    gdk_window_set_opacity (window, .7);
+
+    cairo_surface_t* cairo_surface;
+
+    guchar* pixels = is_raw_image
+            ? (guchar*) convert_BGRA_to_RGBA((const int*) gdk_pixbuf_get_pixels(pixbuf),
+                                                gdk_pixbuf_get_rowstride(pixbuf), h)
+            : gdk_pixbuf_get_pixels(pixbuf);
+
+    cairo_surface = cairo_image_surface_create_for_data(
+            pixels,
+            CAIRO_FORMAT_ARGB32,
+            w, h, w* 4);
+
+    cairo_set_source_surface(context, cairo_surface, 0, 0);
+    cairo_set_operator(context, CAIRO_OPERATOR_SOURCE);
+    cairo_paint(context);
+
+    if (is_raw_image) {
+        g_free(pixels);
+    }
+
+    cairo_surface_destroy(cairo_surface);
+    gdk_window_show(window);
 }
+#endif
 #endif
 
 gboolean is_in_drag()
@@ -643,16 +766,6 @@ static void determine_actions(guint state, GdkDragAction *action, GdkDragAction 
     } else {
         *action = static_cast<GdkDragAction>(0);
     }
-}
-
-static jobject dnd_source_get_data(const char *key)
-{
-    jobject data = (jobject)g_object_get_data(G_OBJECT(dnd_window), SOURCE_DND_DATA);
-    jstring string = mainEnv->NewStringUTF(key);
-    EXCEPTION_OCCURED(mainEnv);
-    jobject result = mainEnv->CallObjectMethod(data, jMapGet, string, NULL);
-
-    return (EXCEPTION_OCCURED(mainEnv)) ? NULL : result;
 }
 
 static gboolean dnd_source_set_utf8_string(GdkWindow *requestor, GdkAtom property)
@@ -1102,8 +1215,6 @@ static void dnd_source_push_data(JNIEnv *env, jobject data, jint supported)
     g_object_set_data_full(G_OBJECT(src_window), SOURCE_DND_DATA, data, clear_global_ref);
     g_object_set_data(G_OBJECT(src_window), SOURCE_DND_ACTIONS, (gpointer)actions);
 
-    DragView::set_drag_view();
-
 #ifdef GLASS_GTK3
     GdkDevice *device = gdk_device_manager_get_client_pointer(
                     gdk_display_get_device_manager(
@@ -1120,29 +1231,32 @@ static void dnd_source_push_data(JNIEnv *env, jobject data, jint supported)
 #ifdef GLASS_GTK3
     if (gtk_get_minor_version() >= 20) {
 
-//#if GTK_CHECK_VERSION(3, 20, 0)
-//        if(gdk_drag_context_manage_dnd(ctx, src_window, actions)) {
-//            GdkAtom selection = gdk_drag_get_selection(ctx);
-//
-//            gdk_selection_owner_set_for_display(gdk_display_get_default(), dnd_window, selection,
-//                                                    GDK_CURRENT_TIME, FALSE);
-//
-//            g_signal_connect(ctx, "cancel",
-//                G_CALLBACK(dnd_cancel_callback), NULL);
-//
-//            g_signal_connect(ctx, "drop-performed",
-//                G_CALLBACK(dnd_drop_performed_callback), NULL);
-//
-//            g_signal_connect(ctx, "action-changed",
-//                G_CALLBACK(dnd_action_changed_callback), NULL);
-//
-//            is_managed = TRUE;
-//        }
-//        else {
-//            g_warning("Unable to manage dnd");
-//            is_managed = FALSE;
-//        }
-//#endif
+#if GTK_CHECK_VERSION(3, 20, 0)
+        if(gdk_drag_context_manage_dnd(ctx, src_window, actions)) {
+            GdkAtom selection = gdk_drag_get_selection(ctx);
+
+            gdk_selection_owner_set_for_display(gdk_display_get_default(), dnd_window, selection,
+                                                    GDK_CURRENT_TIME, FALSE);
+
+            GdkWindow *drag_view = gdk_drag_context_get_drag_window(ctx);
+            paint_drag_view(drag_view);
+
+            g_signal_connect(ctx, "cancel",
+                G_CALLBACK(dnd_cancel_callback), NULL);
+
+            g_signal_connect(ctx, "drop-performed",
+                G_CALLBACK(dnd_drop_performed_callback), NULL);
+
+            g_signal_connect(ctx, "action-changed",
+                G_CALLBACK(dnd_action_changed_callback), NULL);
+
+            is_managed = TRUE;
+        }
+        else {
+            g_warning("Unable to manage dnd");
+            is_managed = FALSE;
+        }
+#endif
 
         // according to GDK docs, this is only fired on managed mode, but
         // on 3.20+ the GDK_DROP_FINISHED event stopped working and this signal
@@ -1155,6 +1269,8 @@ static void dnd_source_push_data(JNIEnv *env, jobject data, jint supported)
     }
 
     if(!is_managed) {
+        DragView::set_drag_view();
+
         if(gdk_device_grab(device, src_window, GDK_OWNERSHIP_NONE, FALSE,
                         (GdkEventMask)
                              (GDK_POINTER_MOTION_MASK
@@ -1218,88 +1334,9 @@ gboolean DragView::get_drag_image_offset(int* x, int* y) {
     return offset_set;
 }
 
-static void pixbufDestroyNotifyFunc(guchar *pixels, gpointer) {
-    if (pixels != NULL) {
-        g_free(pixels);
-    }
-}
 
 GdkPixbuf* DragView::get_drag_image(gboolean* is_raw_image, gint* width, gint* height) {
-    GdkPixbuf *pixbuf = NULL;
-    gboolean is_raw = FALSE;
-
-    jobject drag_image = dnd_source_get_data("application/x-java-drag-image");
-
-    if (drag_image) {
-        jbyteArray byteArray = (jbyteArray) mainEnv->CallObjectMethod(drag_image, jByteBufferArray);
-        if (!EXCEPTION_OCCURED(mainEnv)) {
-
-            jbyte* raw = mainEnv->GetByteArrayElements(byteArray, NULL);
-            jsize nraw = mainEnv->GetArrayLength(byteArray);
-
-            int w = 0, h = 0;
-            int whsz = sizeof(jint) * 2; // Pixels are stored right after two ints
-                                         // in this byteArray: width and height
-            if (nraw > whsz) {
-                jint* int_raw = (jint*) raw;
-                w = BSWAP_32(int_raw[0]);
-                h = BSWAP_32(int_raw[1]);
-
-                // We should have enough pixels for requested width and height
-                if ((nraw - whsz) / 4 - w * h >= 0 ) {
-                    guchar* data = (guchar*) g_try_malloc0(nraw - whsz);
-                    if (data) {
-                        memcpy(data, (raw + whsz), nraw - whsz);
-                        pixbuf = gdk_pixbuf_new_from_data(data, GDK_COLORSPACE_RGB, TRUE, 8,
-                                w, h, w * 4, pixbufDestroyNotifyFunc, NULL);
-                    }
-                }
-            }
-            mainEnv->ReleaseByteArrayElements(byteArray, raw, JNI_ABORT);
-        }
-    }
-
-    if (!GDK_IS_PIXBUF(pixbuf)) {
-        jobject pixels = dnd_source_get_data("application/x-java-rawimage");
-        if (pixels) {
-            is_raw = TRUE;
-            mainEnv->CallVoidMethod(pixels, jPixelsAttachData, PTR_TO_JLONG(&pixbuf));
-            CHECK_JNI_EXCEPTION_RET(mainEnv, NULL)
-        }
-    }
-
-    if (!GDK_IS_PIXBUF(pixbuf)) {
-        return NULL;
-    }
-
-    int w = gdk_pixbuf_get_width(pixbuf);
-    int h = gdk_pixbuf_get_height(pixbuf);
-
-    if (w > DRAG_IMAGE_MAX_WIDTH || h > DRAG_IMAGE_MAX_HEIGH) {
-        double rw = DRAG_IMAGE_MAX_WIDTH / (double)w;
-        double rh =  DRAG_IMAGE_MAX_HEIGH / (double)h;
-        double r = MIN(rw, rh);
-
-
-        int new_w = w * r;
-        int new_h = h * r;
-
-        w = new_w;
-        h = new_h;
-
-        GdkPixbuf *tmp_pixbuf = gdk_pixbuf_scale_simple(pixbuf, new_w, new_h, GDK_INTERP_TILES);
-        g_object_unref(pixbuf);
-        if (!GDK_IS_PIXBUF(tmp_pixbuf)) {
-            return NULL;
-        }
-        pixbuf = tmp_pixbuf;
-    }
-
-    *is_raw_image = is_raw;
-    *width = w;
-    *height = h;
-
-    return pixbuf;
+    return _get_drag_image(is_raw_image, width, height);
 }
 
 void DragView::set_drag_view() {
