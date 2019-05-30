@@ -681,11 +681,12 @@ static gboolean dnd_update_drag_view(gpointer) {
 
 #if GTK_CHECK_VERSION(3, 20, 0)
 static void dnd_drop_performed_callback(GdkDragContext *ctx, gint time, gpointer user_data) {
-
+    g_print("DROP PERFORMED\n");
 }
 
 static void dnd_action_changed_callback(GdkDragContext *ctx, GdkDragAction action, gpointer user_data) {
     //EMPTY
+    g_print("ACTION CHANGED\n");
 }
 
 static void dnd_cancel_callback(GdkDragContext *ctx, GdkDragCancelReason reason, gpointer user_data) {
@@ -694,41 +695,41 @@ static void dnd_cancel_callback(GdkDragContext *ctx, GdkDragCancelReason reason,
 }
 
 static void paint_drag_view(GdkWindow *window) {
-    cairo_t *context = gdk_cairo_create(window);
-
-    gboolean is_raw_image;
-    gint w, h;
-
-    GdkPixbuf* pixbuf = _get_drag_image(&is_raw_image, &w, &h);
-
-    if(pixbuf == NULL)
-        return;
-
-    gdk_window_resize(window, w, h);
-    gdk_window_set_opacity (window, .7);
-
-    cairo_surface_t* cairo_surface;
-
-    guchar* pixels = is_raw_image
-            ? (guchar*) convert_BGRA_to_RGBA((const int*) gdk_pixbuf_get_pixels(pixbuf),
-                                                gdk_pixbuf_get_rowstride(pixbuf), h)
-            : gdk_pixbuf_get_pixels(pixbuf);
-
-    cairo_surface = cairo_image_surface_create_for_data(
-            pixels,
-            CAIRO_FORMAT_ARGB32,
-            w, h, w* 4);
-
-    cairo_set_source_surface(context, cairo_surface, 0, 0);
-    cairo_set_operator(context, CAIRO_OPERATOR_SOURCE);
-    cairo_paint(context);
-
-    if (is_raw_image) {
-        g_free(pixels);
-    }
-
-    cairo_surface_destroy(cairo_surface);
-    gdk_window_show(window);
+//    cairo_t *context = gdk_cairo_create(window);
+//
+//    gboolean is_raw_image;
+//    gint w, h;
+//
+//    GdkPixbuf* pixbuf = _get_drag_image(&is_raw_image, &w, &h);
+//
+//    if(pixbuf == NULL)
+//        return;
+//
+//    gdk_window_resize(window, w, h);
+//    gdk_window_set_opacity (window, .7);
+//
+//    cairo_surface_t* cairo_surface;
+//
+//    guchar* pixels = is_raw_image
+//            ? (guchar*) convert_BGRA_to_RGBA((const int*) gdk_pixbuf_get_pixels(pixbuf),
+//                                                gdk_pixbuf_get_rowstride(pixbuf), h)
+//            : gdk_pixbuf_get_pixels(pixbuf);
+//
+//    cairo_surface = cairo_image_surface_create_for_data(
+//            pixels,
+//            CAIRO_FORMAT_ARGB32,
+//            w, h, w* 4);
+//
+//    cairo_set_source_surface(context, cairo_surface, 0, 0);
+//    cairo_set_operator(context, CAIRO_OPERATOR_SOURCE);
+//    cairo_paint(context);
+//
+//    if (is_raw_image) {
+//        g_free(pixels);
+//    }
+//
+//    cairo_surface_destroy(cairo_surface);
+//    gdk_window_show(window);
 }
 #endif
 #endif
@@ -1056,16 +1057,8 @@ static void process_dnd_source_drag_status(GdkWindow *window, GdkEvent *event)
     gdk_threads_add_idle_full (GDK_PRIORITY_REDRAW + 5, dnd_update_drag_view,
                                NULL, NULL);
 
-    if (selected & GDK_ACTION_COPY) {
-        cursor = gdk_cursor_new_from_name(gdk_display_get_default(), "copy");
-    } else if (selected & (GDK_ACTION_MOVE | GDK_ACTION_PRIVATE)) {
-        cursor = gdk_cursor_new_from_name(gdk_display_get_default(), "move");
-    } else if (selected & GDK_ACTION_LINK) {
-        cursor = gdk_cursor_new_from_name(gdk_display_get_default(), "alias");
-    } else {
-        cursor = gdk_cursor_new_from_name(gdk_display_get_default(), "no-drop");
-    }
-#else
+#endif
+
     if (selected & GDK_ACTION_COPY) {
         cursor = gdk_cursor_new_from_name(gdk_display_get_default(), "dnd-copy");
         if (cursor == NULL) {
@@ -1102,7 +1095,6 @@ static void process_dnd_source_drag_status(GdkWindow *window, GdkEvent *event)
             cursor = gdk_cursor_new_from_name(gdk_display_get_default(), "dnd-none");
         }
     }
-#endif
 
     if (cursor == NULL) {
         cursor = gdk_cursor_new_from_name(gdk_display_get_default(), "default");
@@ -1225,7 +1217,6 @@ static void dnd_source_push_data(JNIEnv *env, jobject data, jint supported)
     ctx = gdk_drag_begin(src_window, targets);
 #endif
 
-    g_list_free(targets);
     g_object_set_data(G_OBJECT(src_window), SOURCE_DND_CONTEXT, ctx);
 
 #ifdef GLASS_GTK3
@@ -1235,8 +1226,8 @@ static void dnd_source_push_data(JNIEnv *env, jobject data, jint supported)
         if(gdk_drag_context_manage_dnd(ctx, src_window, actions)) {
             GdkAtom selection = gdk_drag_get_selection(ctx);
 
-            gdk_selection_owner_set_for_display(gdk_display_get_default(), dnd_window, selection,
-                                                    GDK_CURRENT_TIME, FALSE);
+//            gdk_selection_owner_set_for_display(gdk_display_get_default(), dnd_window, selection,
+//                                                    GDK_CURRENT_TIME, FALSE);
 
             GdkWindow *drag_view = gdk_drag_context_get_drag_window(ctx);
             paint_drag_view(drag_view);
@@ -1286,6 +1277,8 @@ static void dnd_source_push_data(JNIEnv *env, jobject data, jint supported)
 #else
     dnd_pointer_grab(NULL, NULL);
 #endif
+
+    g_list_free(targets);
 
     is_dnd_owner = TRUE;
 }
