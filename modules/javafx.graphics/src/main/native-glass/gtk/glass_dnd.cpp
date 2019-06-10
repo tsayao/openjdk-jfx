@@ -1294,6 +1294,14 @@ DragView::View::View(GdkPixbuf* _pixbuf, gboolean _is_raw_image,
     width = gdk_pixbuf_get_width(pixbuf);
     height = gdk_pixbuf_get_height(pixbuf);
 
+#ifdef GLASS_GTK3
+    // do not keep it under the pointer, it will on the way of the drop area
+    if (offset_y == 0 && offset_x == 0) {
+        offset_y = -1;
+        offset_x = -1;
+    }
+#endif
+
     widget = gtk_window_new(GTK_WINDOW_POPUP);
     gtk_window_set_type_hint(GTK_WINDOW(widget), GDK_WINDOW_TYPE_HINT_DND);
     gtk_widget_set_events(widget, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK);
